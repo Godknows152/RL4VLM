@@ -1,0 +1,39 @@
+# Large local data/artifacts
+checkpoints/
+data/
+swanlablog/
+dependences/
+
+# Nested project runtime artifacts
+verl/checkpoints/
+verl/outputs/
+verl/wandb/
+verl/wget-log
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+*.whl
+.eggs/
+**/.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+**/build/
+**/dist/
+
+# Build/download artifacts
+*.tar
+*.tar.gz
+*.zip
+
+# IDE/system
+.DS_Store
+.vscode/

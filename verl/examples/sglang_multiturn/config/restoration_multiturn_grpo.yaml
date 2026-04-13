@@ -1,0 +1,127 @@
+# Image Restoration Multi-turn GRPO Training Configuration
+#
+# This configuration trains a VLM to perform iterative image restoration
+# by selecting appropriate restoration tools based on observed degradation.
+#
+# Usage:
+#   cd /home/LXJ/Python_Projects/verl/verl
+#   python3 -m verl.trainer.main_ppo \
+#     --config-path="$(pwd)/examples/sglang_multiturn/config" \
+#     --config-name='restoration_multiturn_grpo'
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Data configuration
+# 数据位置: /home/LXJ/Python_Projects/verl/data/restoration/
+# 支持多个parquet文件，使用列表格式
+data:
+  train_files:
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/all_decision_train.parquet
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/fog_decision_train.parquet
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/night_decision_train.parquet
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/snow_decision_train.parquet
+  val_files:
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/all_decision_test.parquet
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/fog_decision_test.parquet
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/night_decision_test.parquet
+    - /home/LXJ/Python_Projects/verl/data/restoration/converted/snow_decision_test.parquet
+  train_batch_size: 8
+  max_prompt_length: 2048
+  max_response_length: 4096
+  return_raw_chat: true
+  # Important: Set to False for multi-turn with tool-generated images
+  return_multi_modal_inputs: false
+
+# Algorithm configuration
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    kl_coef: 0.01  # Increased to prevent rapid policy drift
+
+# Actor-Rollout-Ref configuration
+actor_rollout_ref:
+  model:
+    path: /home/LXJ/Python_Projects/ViGoRL/Qwen_Model/Qwen3-VL-8B-Instruct_for_sft
+    # Or use a local path
+    # path: /path/to/your/vlm/model
+  
+  actor:
+    optim:
+      lr: 1e-5
+    # Entropy bonus to encourage exploration and prevent entropy collapse
+    entropy_coeff: 0.1
+    # KL loss to constrain policy drift from reference model
+    use_kl_loss: true
+    kl_loss_coef: 0.01
+    # CPU offload for actor to reduce GPU memory usage (official verl fsdp_config format)
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+    # ppo_mini_batch_size / n_gpus must be >= ppo_micro_batch_size_per_gpu
+    # With 4 GPUs: 8 / 4 = 2 >= 2 ✓
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 2
+  
+  rollout:
+    name: sglang
+    tensor_model_parallel_size: 1
+    # With CPU offload enabled, can use more GPU memory for rollout
+    gpu_memory_utilization: 0.45
+    log_prob_micro_batch_size_per_gpu: 2
+
+    # Skip SGLang's tokenizer init since agent loop handles tokenization locally
+    # This avoids issues with Qwen3VL's new processor not being fully supported
+    # skip_tokenizer_init: true
+    
+    # Agent loop worker settings
+    agent:
+      # Set to 1 to avoid GPU OOM - each worker loads multiple restoration models (~13GB)
+      # Total GPU usage: SGLang(~34GB) + 1 Worker(~13GB) + Training(~15GB) ≈ 62GB
+      num_workers: 1
+      default_agent_loop: tool_agent
+      # GPU allocation: Set to 0 because all GPUs are reserved by SGLang placement groups
+      # RestorationToolkit will access GPU directly via CUDA without Ray allocation
+      num_gpus_per_worker: 0
+    
+    # Multi-turn rollout settings
+    multi_turn:
+      enable: true
+      max_user_turns: 10
+      max_assistant_turns: 10
+      format: answer  # Use <answer>tool_name</answer> format for tool parsing
+      tool_config_path: examples/sglang_multiturn/config/tool_config/restoration_tool_config.yaml
+      interaction_config_path: examples/sglang_multiturn/config/interaction_config/restoration_interaction_config.yaml
+  
+  ref:
+    log_prob_micro_batch_size_per_gpu: 2
+    # CPU offload for reference model (official verl fsdp_config format)
+
+# Critic configuration (for PPO, not needed for pure GRPO)
+# critic:
+#   model:
+#     path: Qwen/Qwen2.5-VL-7B-Instruct
+#   optim:
+#     lr: 1e-5
+#   ppo_micro_batch_size_per_gpu: 2
+
+# Trainer configuration
+trainer:
+  logger:
+    - console
+    - swanlab
+  project_name: Verl
+  experiment_name: 多轮强化学习_0305
+  # 可选：记录每轮评估时生成的文本数量
+  log_val_generations: 10
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 100
+  test_freq: 100
+  total_epochs: 15
+  val_before_train: false
