@@ -97,6 +97,8 @@ class ImageRestorationInteraction(BaseInteraction):
                 - use_iqa: Use IQA metrics for scoring (default: True)
                 - device: Device for IQA scoring (default: 'cuda')
                 - reward_scale: Scale factor for final reward (default: 10.0)
+                - alpha: Marginal gain coefficient in [0, 1] (default: 0.9)
+                  beta is computed as (1 - alpha) for identity anchoring.
         """
         super().__init__(config)
         self._instance_dict = {}
@@ -105,7 +107,11 @@ class ImageRestorationInteraction(BaseInteraction):
         self.max_iterations = config.get("max_iterations", 10)
         self.use_iqa = config.get("use_iqa", True)
         self.device = config.get("device", "cuda")
-        self.reward_scale = config.get("reward_scale", 10.0)
+        self.reward_scale = config.get("reward_scale", 1.0)
+        self.alpha = float(config.get("alpha", 0.9))
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(f"alpha must be in [0, 1], got {self.alpha}")
+        self.beta = 1.0 - self.alpha
 
         # Lazy load IQA scorer
         self._iqa_scorer = None
@@ -114,7 +120,8 @@ class ImageRestorationInteraction(BaseInteraction):
             f"ImageRestorationInteraction initialized: "
             f"max_iter={self.max_iterations}, "
             f"use_iqa={self.use_iqa}, "
-            f"device={self.device}"
+            f"device={self.device}, "
+            f"alpha={self.alpha:.3f}, beta={self.beta:.3f}"
         )
 
     @property
@@ -199,6 +206,7 @@ class ImageRestorationInteraction(BaseInteraction):
             "rewards": [],  # Calculated rewards for each step
             "iteration": 0,
             "identity_score": identity_score,  # IQA score of original image
+            "prev_score": identity_score,  # IQA score of previous restoration step
             "degradation_type": degradation_type,
             "weights": weights,
         }
@@ -290,6 +298,7 @@ class ImageRestorationInteraction(BaseInteraction):
             instance["rewards"].append(reward)
             if raw_score is not None:
                 instance["scores"].append(raw_score)
+                instance["prev_score"] = raw_score
             instance["iteration"] += 1
 
             # Update current image (always move forward in multi-turn)
@@ -336,11 +345,13 @@ class ImageRestorationInteraction(BaseInteraction):
     ) -> tuple[float, Optional[list]]:
         """Calculate the reward by comparing processed image with identity score.
 
-        Reward calculation follows JarvisIR logic:
+        Reward calculation uses a mixed objective:
         1. Get IQA scores for processed image [qalign, maniqa, musiq, clipiqa, niqe]
-        2. Compute diff = processed_score - identity_score
-        3. Apply degradation-type-specific weights
-        4. Final reward = sum(weighted_diff) * scale (absolute difference, no normalization)
+        2. Compute marginal diff = processed_score - prev_score
+        3. Compute identity diff = processed_score - identity_score
+        4. Apply degradation-type-specific weights
+        5. Blend: combined = alpha * marginal + (1-alpha) * identity
+        6. Final reward = combined * scale
 
         Args:
             instance_id: The instance id.
@@ -354,6 +365,7 @@ class ImageRestorationInteraction(BaseInteraction):
             return -5.0, None  # Severe penalty for missing instance
 
         identity_score = instance.get("identity_score")
+        prev_score = instance.get("prev_score", identity_score)
         weights = instance.get("weights", DEFAULT_WEIGHT)
 
         if not self.use_iqa or self.iqa_scorer is None:
@@ -363,6 +375,8 @@ class ImageRestorationInteraction(BaseInteraction):
         if identity_score is None:
             logger.warning("Identity score not available, returning 0 reward")
             return 0.0, None
+        if prev_score is None:
+            prev_score = identity_score
 
         try:
             # Get IQA scores for processed image
@@ -372,24 +386,28 @@ class ImageRestorationInteraction(BaseInteraction):
             device = self.device
             processed_tensor = torch.tensor(processed_score, device=device, dtype=torch.float32)
             identity_tensor = torch.tensor(identity_score, device=device, dtype=torch.float32)
+            prev_tensor = torch.tensor(prev_score, device=device, dtype=torch.float32)
             weights_tensor = torch.tensor(weights, device=device, dtype=torch.float32)
 
-            # Calculate difference
-            diff = processed_tensor - identity_tensor
+            # Calculate marginal and identity-anchored differences
+            marginal_diff = processed_tensor - prev_tensor
+            identity_diff = processed_tensor - identity_tensor
 
-            # Apply weights (absolute difference, no normalization)
-            weighted_diff = diff * weights_tensor
-            normalized_score = weighted_diff.sum()
+            # Apply weights and blend with alpha/beta
+            weighted_marginal = (marginal_diff * weights_tensor).sum()
+            weighted_identity = (identity_diff * weights_tensor).sum()
+            mixed_score = self.alpha * weighted_marginal + self.beta * weighted_identity
 
             # Scale the reward
-            reward = normalized_score.item() * self.reward_scale
+            reward = mixed_score.item() * self.reward_scale
 
             # Clamp reward to reasonable range (allow wider range for absolute diff)
             reward = max(-10.0, min(10.0, reward))
 
             logger.debug(
                 f"Reward calculation: identity={identity_score}, "
-                f"processed={processed_score}, diff={diff.tolist()}, "
+                f"prev={prev_score}, processed={processed_score}, "
+                f"marginal={marginal_diff.tolist()}, identity={identity_diff.tolist()}, "
                 f"reward={reward:.4f}"
             )
 
