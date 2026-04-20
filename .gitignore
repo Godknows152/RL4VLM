@@ -37,3 +37,6 @@ dist/
 # IDE/system
 .DS_Store
 .vscode/
+
+# Temp fork working directory
+.tmp_verl_fork/

@@ -1,0 +1,4 @@
+[submodule "verl"]
+	path = verl
+	url = https://github.com/Godknows152/verl.git
+	branch = rl4vlm-main
